@@ -1,0 +1,1603 @@
+Role: You are an expert in GENAI and python development with 15 years of experience
+Context: Need your help you create a new project with prompt engg and llm agent flow 
+Requirements:
+I got three microservices like ordersapi,customerapi and generic-query-executor
+I got one postgres sql with two tables one is orders and other one is customers in the schema demo 
+I want to create a prompt engg and llm agent flow which will be able to fetch the data from these two tables and give the response to the user in natural language
+we have our query executor microservice which can execute the sql query and return the result in json format
+I want to create a prompt engineering flow where the user can input their query in natural language and the system will convert that into a SQL query, execute it using the generic-query-executor microservice
+and then return the result back to the user in natural language.
+To create a prompt engineering flow that converts natural language queries into SQL queries, executes them using the generic-query-executor microservice, and returns the results in natural language, we can follow these steps:
+1. **Define the Prompt Engineering Flow**:
+   - Create a function that takes a natural language query as input.
+   - Use a language model (like GPT-3 or GPT-4) to convert the natural language query into a SQL query.
+   - Send the generated SQL query to the generic-query-executor microservice.
+   - Receive the results from the microservice and convert them back into natural language for the user
+2. **Implement the Functionality**:
+Here's a sample implementation in Python using the OpenAI API for the language model and a simple HTTP request to the generic-query-executor microservice.  
+
+Existing code:
+
+ordersapi:
+
+
+"""
+Orders API Lambda Function
+=========================
+
+This Lambda function exposes REST-style endpoints for managing orders.
+It performs CRUD operations on the `demo.orders` table by delegating
+all database access to a shared Generic Query Executor Lambda.
+
+Architecture Pattern
+--------------------
+API Gateway
+    -> Orders API Lambda (this file)
+        -> Generic Query Executor Lambda
+            -> RDS PostgreSQL
+
+Why this design?
+----------------
+- Keeps business logic separate from database access
+- Ensures consistent DB access patterns across services
+- Centralizes security, secrets, and connection pooling
+"""
+
+import json
+import os
+import boto3
+import logging
+import traceback
+from typing import Dict, Any
+from datetime import datetime, UTC
+
+# ---------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# ---------------------------------------------------------
+# AWS Clients
+# ---------------------------------------------------------
+
+# Lambda client used to invoke the generic query executor
+lambda_client = boto3.client("lambda")
+
+# Name of the generic query executor Lambda
+# Can be overridden using environment variables
+QUERY_EXECUTOR_FUNCTION = os.environ.get(
+    "QUERY_EXECUTOR_FUNCTION",
+    "generic-query-executor"
+)
+
+logger.info(f"Initialized with QUERY_EXECUTOR_FUNCTION: {QUERY_EXECUTOR_FUNCTION}")
+
+# ---------------------------------------------------------
+# Helper: Invoke Generic Query Executor
+# ---------------------------------------------------------
+
+def invoke_query_executor(
+    query: str,
+    params: list = None,
+    fetch: bool = True
+) -> Dict[str, Any]:
+    """
+    Invoke the Generic Query Executor Lambda.
+
+    Parameters
+    ----------
+    query : str
+        Parameterized SQL query (%s placeholders).
+    params : list, optional
+        Parameters for the SQL query.
+    fetch : bool
+        Whether results should be fetched and returned.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Normalized response containing:
+        - success
+        - data (optional)
+        - rowcount (optional)
+        - error (optional)
+    """
+
+    logger.info(f"Invoking query executor function: {QUERY_EXECUTOR_FUNCTION}, query: {query[:100]}, params: {len(params or [])}, fetch: {fetch}")
+
+    payload = {
+        "query": query,
+        "params": params or [],
+        "fetch": fetch
+    }
+
+    try:
+        # Synchronous invocation so caller waits for DB result
+        response = lambda_client.invoke(
+            FunctionName=QUERY_EXECUTOR_FUNCTION,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(payload)
+        )
+
+        logger.info(f"Query executor invocation successful, status code: {response.get('StatusCode')}")
+
+        response_payload = json.loads(response["Payload"].read())
+
+        # Handle API Gateway-style responses
+        if isinstance(response_payload.get("body"), str):
+            result = json.loads(response_payload["body"])
+        else:
+            result = response_payload
+
+        if result.get("success"):
+            logger.info(f"Query executed successfully, rowcount: {result.get('rowcount')}, data_count: {len(result.get('data', []))}")
+        else:
+            logger.error(f"Query execution failed, error: {result.get('error')}")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Failed to invoke query executor: {QUERY_EXECUTOR_FUNCTION}, error: {str(e)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
+        return {
+            "success": False,
+            "error": f"Lambda invocation failed: {str(e)}"
+        }
+
+
+# ---------------------------------------------------------
+# POST /orders
+# ---------------------------------------------------------
+
+def create_order(event_body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Create a new order.
+
+    Endpoint
+    --------
+    POST /orders
+
+    Expected Request Body
+    ---------------------
+    {
+        "order_id": "ORD001",
+        "customer_id": "CUST001",
+        "status": "pending",
+        "total_amount": 150.75
+    }
+
+    Business Rules
+    --------------
+    - customer_id must exist in customers table
+    - status defaults to 'pending' if not provided
+    """
+
+    logger.info(f"Creating new order, order_id: {event_body.get('order_id')}, customer_id: {event_body.get('customer_id')}, total_amount: {event_body.get('total_amount')}")
+
+    # Validate required fields
+    required_fields = ["order_id", "customer_id", "total_amount"]
+    for field in required_fields:
+        if field not in event_body:
+            logger.warning(f"Missing required field: {field}")
+            return {
+                "statusCode": 400,
+                "body": json.dumps({
+                    "success": False,
+                    "error": f"Missing required field: {field}"
+                })
+            }
+
+    # Ensure referenced customer exists (FK-style validation)
+    logger.info(f"Validating customer exists, customer_id: {event_body['customer_id']}")
+
+    check_query = """
+    SELECT customer_id
+    FROM demo.customers
+    WHERE customer_id = %s
+    """
+
+    check_result = invoke_query_executor(
+        check_query,
+        [event_body["customer_id"]],
+        fetch=True
+    )
+
+    if not check_result.get("success") or not check_result.get("data"):
+        logger.warning(f"Customer does not exist, customer_id: {event_body['customer_id']}")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({
+                "success": False,
+                "error": f"Customer {event_body['customer_id']} does not exist"
+            })
+        }
+
+    logger.info(f"Customer validation successful, customer_id: {event_body['customer_id']}")
+
+    # Insert new order - let PostgreSQL handle the timestamp
+    query = """
+    INSERT INTO demo.orders
+    (order_id, customer_id, order_date, status, total_amount)
+    VALUES (%s, %s, CURRENT_TIMESTAMP, %s, %s)
+    RETURNING order_id, customer_id, order_date, status, total_amount
+    """
+
+    params = [
+        event_body["order_id"],
+        event_body["customer_id"],
+        event_body.get("status", "pending"),     # Default order status
+        event_body["total_amount"]
+    ]
+
+    logger.info(f"Executing order insert, order_id: {event_body['order_id']}, status: {event_body.get('status', 'pending')}")
+
+    result = invoke_query_executor(query, params, fetch=True)
+
+    if result.get("success"):
+        logger.info(f"Order created successfully, order_id: {event_body['order_id']}")
+        return {
+            "statusCode": 201,
+            "body": json.dumps({
+                "success": True,
+                "message": "Order created successfully",
+                "data": result.get("data", [])[0] if result.get("data") else None
+            }, default=str)
+        }
+
+    logger.error(f"Failed to create order, order_id: {event_body['order_id']}, error: {result.get('error')}")
+    return {
+        "statusCode": 500,
+        "body": json.dumps({
+            "success": False,
+            "error": result.get("error", "Unknown error")
+        })
+    }
+
+
+# ---------------------------------------------------------
+# GET /orders
+# ---------------------------------------------------------
+
+def get_orders(query_params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Retrieve orders.
+
+    Endpoint
+    --------
+    GET /orders
+    GET /orders?order_id=ORD001
+    GET /orders?customer_id=CUST001
+
+    Query Parameters
+    ----------------
+    - order_id: Fetch specific order
+    - customer_id: Fetch all orders for a customer
+    - (no parameters): Fetch all orders
+
+    Behavior
+    --------
+    - order_id → fetch specific order
+    - customer_id → fetch all orders for a customer
+    - no filters → fetch all orders
+    """
+
+    order_id = query_params.get("order_id")
+    customer_id = query_params.get("customer_id")
+
+    logger.info(f"Fetching orders, order_id: {order_id}, customer_id: {customer_id}")
+
+    if order_id:
+        query = """
+        SELECT o.order_id, o.customer_id, o.order_date, o.status, o.total_amount,
+               c.customer_name, c.email
+        FROM demo.orders o
+        JOIN demo.customers c ON o.customer_id = c.customer_id
+        WHERE o.order_id = %s
+        """
+        params = [order_id]
+
+    elif customer_id:
+        query = """
+        SELECT o.order_id, o.customer_id, o.order_date, o.status, o.total_amount,
+               c.customer_name, c.email
+        FROM demo.orders o
+        JOIN demo.customers c ON o.customer_id = c.customer_id
+        WHERE o.customer_id = %s
+        ORDER BY o.order_date DESC
+        """
+        params = [customer_id]
+
+    else:
+        query = """
+        SELECT o.order_id, o.customer_id, o.order_date, o.status, o.total_amount,
+               c.customer_name, c.email
+        FROM demo.orders o
+        JOIN demo.customers c ON o.customer_id = c.customer_id
+        ORDER BY o.order_date DESC
+        """
+        params = []
+
+    logger.info(f"Executing query: {query}")
+
+    result = invoke_query_executor(query, params, fetch=True)
+
+    if result.get("success"):
+        data = result.get("data", [])
+        logger.info(f"Orders fetched successfully, order_id: {order_id}, customer_id: {customer_id}, count: {len(data)}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "success": True,
+                "data": data,
+                "count": len(data)
+            }, default=str)
+        }
+
+    logger.error(f"Failed to fetch orders, order_id: {order_id}, customer_id: {customer_id}, error: {result.get('error')}")
+    return {
+        "statusCode": 500,
+        "body": json.dumps({
+            "success": False,
+            "error": result.get("error", "Unknown error")
+        })
+    }
+
+
+# ---------------------------------------------------------
+# PUT /orders/{order_id}
+# ---------------------------------------------------------
+
+def update_order(order_id: str, event_body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Update an existing order.
+
+    Endpoint
+    --------
+    PUT /orders?order_id=ORD001
+
+    Query Parameters
+    ----------------
+    - order_id: Required - ID of the order to update
+
+    Updatable Fields
+    ----------------
+    - status
+    - total_amount
+    """
+
+    logger.info(f"Updating order, order_id: {order_id}, fields: {list(event_body.keys())}")
+
+    if not order_id:
+        logger.warning("Update attempted without order_id")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({
+                "success": False,
+                "error": "order_id is required"
+            })
+        }
+
+    update_fields = []
+    params = []
+
+    # Build dynamic update query safely
+    if "status" in event_body:
+        update_fields.append("status = %s")
+        params.append(event_body["status"])
+
+    if "total_amount" in event_body:
+        update_fields.append("total_amount = %s")
+        params.append(event_body["total_amount"])
+
+    if not update_fields:
+        logger.warning(f"No fields to update for order_id: {order_id}")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({
+                "success": False,
+                "error": "No fields to update"
+            })
+        }
+
+    # order_id used in WHERE clause
+    params.append(order_id)
+
+    query = f"""
+    UPDATE demo.orders
+    SET {', '.join(update_fields)}
+    WHERE order_id = %s
+    RETURNING order_id, customer_id, order_date, status, total_amount
+    """
+
+    logger.info(f"Executing update query: {query}, params: {params}")
+
+    result = invoke_query_executor(query, params, fetch=True)
+
+    if result.get("success"):
+        if result.get("rowcount", 0) == 0:
+            logger.warning(f"Order not found for update, order_id: {order_id}")
+            return {
+                "statusCode": 404,
+                "body": json.dumps({
+                    "success": False,
+                    "error": f"Order {order_id} not found"
+                })
+            }
+
+        logger.info(f"Order updated successfully, order_id: {order_id}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "success": True,
+                "message": "Order updated successfully",
+                "data": result.get("data", [])[0] if result.get("data") else None
+            }, default=str)
+        }
+
+    logger.error(f"Failed to update order, order_id: {order_id}, error: {result.get('error')}")
+    return {
+        "statusCode": 500,
+        "body": json.dumps({
+            "success": False,
+            "error": result.get("error", "Unknown error")
+        })
+    }
+
+
+# ---------------------------------------------------------
+# DELETE /orders/{order_id}
+# ---------------------------------------------------------
+
+def delete_order(order_id: str) -> Dict[str, Any]:
+    """
+    Delete an order.
+
+    Endpoint
+    --------
+    DELETE /orders?order_id=ORD001
+
+    Query Parameters
+    ----------------
+    - order_id: Required - ID of the order to delete
+    """
+
+    logger.info(f"Deleting order, order_id: {order_id}")
+
+    if not order_id:
+        logger.warning("Delete attempted without order_id")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({
+                "success": False,
+                "error": "order_id is required"
+            })
+        }
+
+    query = """
+    DELETE FROM demo.orders
+    WHERE order_id = %s
+    """
+
+    logger.info(f"Executing delete query: {query}, order_id: {order_id}")
+
+    result = invoke_query_executor(query, [order_id], fetch=False)
+
+    if result.get("success"):
+        if result.get("rowcount", 0) == 0:
+            logger.warning(f"Order not found for deletion, order_id: {order_id}")
+            return {
+                "statusCode": 404,
+                "body": json.dumps({
+                    "success": False,
+                    "error": f"Order {order_id} not found"
+                })
+            }
+
+        logger.info(f"Order deleted successfully, order_id: {order_id}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "success": True,
+                "message": f"Order {order_id} deleted successfully"
+            })
+        }
+
+    logger.error(f"Failed to delete order, order_id: {order_id}, error: {result.get('error')}")
+    return {
+        "statusCode": 500,
+        "body": json.dumps({
+            "success": False,
+            "error": result.get("error", "Unknown error")
+        })
+    }
+
+
+# ---------------------------------------------------------
+# Lambda Entry Point
+# ---------------------------------------------------------
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    AWS Lambda entry point.
+
+    Responsibilities
+    ----------------
+    - Parse API Gateway request
+    - Route based on HTTP method
+    - Attach CORS headers
+    - Handle unexpected failures safely
+    """
+
+    logger.info("Lambda invocation started")
+
+    try:
+        http_method = event.get(
+            "httpMethod",
+            event.get("requestContext", {}).get("http", {}).get("method")
+        )
+
+        path_parameters = event.get("pathParameters") or {}
+        query_parameters = event.get("queryStringParameters") or {}
+
+        logger.info(f"Request received, method: {http_method}, path: {event.get('path')}, query_params: {query_parameters}, path_params: {path_parameters}")
+
+        body = {}
+        if event.get("body"):
+            try:
+                body = json.loads(event["body"]) if isinstance(event["body"], str) else event["body"]
+                logger.info(f"Request body parsed, keys: {list(body.keys())}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in request body, error: {str(e)}")
+                return {
+                    "statusCode": 400,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Access-Control-Allow-Origin": "*"
+                    },
+                    "body": json.dumps({
+                        "success": False,
+                        "error": "Invalid JSON in request body"
+                    })
+                }
+
+        # Route request
+        logger.info(f"Routing request, method: {http_method}")
+
+        if http_method == "POST":
+            response = create_order(body)
+        elif http_method == "GET":
+            response = get_orders(query_parameters)
+        elif http_method == "PUT":
+            response = update_order(
+                query_parameters.get("order_id") or query_parameters.get("id"),
+                body
+            )
+        elif http_method == "DELETE":
+            response = delete_order(
+                query_parameters.get("order_id") or query_parameters.get("id")
+            )
+        else:
+            logger.warning(f"Unsupported HTTP method: {http_method}")
+            response = {
+                "statusCode": 405,
+                "body": json.dumps({
+                    "success": False,
+                    "error": f"Method {http_method} not allowed"
+                })
+            }
+
+        # Standard CORS headers
+        response.setdefault("headers", {})
+        response["headers"].update({
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type"
+        })
+
+        logger.info(f"Lambda invocation completed, status_code: {response.get('statusCode')}")
+
+        return response
+
+    except Exception as e:
+        logger.error(f"Unhandled exception in lambda_handler, error: {str(e)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
+
+        return {
+            "statusCode": 500,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "success": False,
+                "error": str(e)
+            })
+        }
+
+customersapi:
+"""
+Customers API Lambda Function
+=============================
+
+This Lambda function exposes a REST-style API for managing customers.
+It supports CRUD operations (Create, Read, Update, Delete) by delegating
+all database access to a generic query executor Lambda.
+
+Architecture Pattern
+--------------------
+API Gateway
+    -> Customers API Lambda (this file)
+        -> Generic Query Executor Lambda
+            -> Database (Postgres / Aurora / RDS etc.)
+
+Why this design?
+----------------
+- Keeps DB logic centralized and reusable
+- Simplifies security (single DB-access Lambda)
+- Enables consistent logging, retries, and monitoring
+"""
+
+import json
+import os
+import traceback
+import boto3
+import logging
+from typing import Dict, Any
+from datetime import datetime, UTC
+
+# ---------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# ---------------------------------------------------------
+# AWS Clients
+# ---------------------------------------------------------
+
+# Lambda client used to invoke the generic query executor
+lambda_client = boto3.client('lambda')
+
+# Name of the query executor Lambda
+# Can be overridden via environment variables
+QUERY_EXECUTOR_FUNCTION = os.environ.get(
+    'QUERY_EXECUTOR_FUNCTION',
+    'generic-query-executor'
+)
+
+logger.info(f"Initialized with QUERY_EXECUTOR_FUNCTION: {QUERY_EXECUTOR_FUNCTION}")
+
+# ---------------------------------------------------------
+# Helper: Invoke Generic Query Executor
+# ---------------------------------------------------------
+
+def invoke_query_executor(
+    query: str,
+    params: list = None,
+    fetch: bool = True
+) -> Dict[str, Any]:
+    """
+    Invokes the generic query executor Lambda.
+
+    Parameters
+    ----------
+    query : str
+        SQL query to execute (parameterized).
+    params : list, optional
+        Query parameters corresponding to %s placeholders.
+    fetch : bool
+        If True, returns query results (SELECT / RETURNING).
+        If False, executes without fetching data (DELETE).
+
+    Returns
+    -------
+    Dict[str, Any]
+        Normalized response from query executor:
+        {
+            "success": bool,
+            "data": list (optional),
+            "rowcount": int (optional),
+            "error": str (optional)
+        }
+    """
+
+    logger.info(f"Invoking query executor function: {QUERY_EXECUTOR_FUNCTION}, query: {query[:100]}, params: {len(params or [])}, fetch: {fetch}")
+
+    # Payload expected by the query executor Lambda
+    payload = {
+        "query": query,
+        "params": params or [],
+        "fetch": fetch
+    }
+
+    try:
+        # Synchronous Lambda invocation
+        response = lambda_client.invoke(
+            FunctionName=QUERY_EXECUTOR_FUNCTION,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(payload)
+        )
+
+        logger.info(f"Query executor invocation successful, status code: {response.get('StatusCode')}")
+
+        # Read raw payload
+        response_payload = json.loads(response["Payload"].read())
+
+        # Handle API Gateway–style responses (body is a string)
+        if isinstance(response_payload.get("body"), str):
+            result = json.loads(response_payload["body"])
+        else:
+            result = response_payload
+
+        if result.get("success"):
+            logger.info(f"Query executed successfully, rowcount: {result.get('rowcount')}, data_count: {len(result.get('data', []))}")
+        else:
+            logger.error(f"Query execution failed, error: {result.get('error')}")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Failed to invoke query executor: {QUERY_EXECUTOR_FUNCTION}, error: {str(e)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
+        return {
+            "success": False,
+            "error": f"Lambda invocation failed: {str(e)}"
+        }
+
+
+# ---------------------------------------------------------
+# POST /customers
+# ---------------------------------------------------------
+
+def create_customer(event_body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Creates a new customer record.
+
+    Endpoint
+    --------
+    POST /customers
+
+    Expected Request Body
+    ---------------------
+    {
+        "customer_id": "CUST001",
+        "customer_name": "John Doe",
+        "email": "john@example.com",
+        "city": "New York",
+        "state": "NY"
+    }
+
+    Returns
+    -------
+    201 Created
+        Customer record if successful
+    400 Bad Request
+        Missing required fields
+    500 Internal Server Error
+        DB or execution error
+    """
+
+    logger.info(f"Creating new customer, customer_id: {event_body.get('customer_id')}, email: {event_body.get('email')}")
+
+    # Required fields validation
+    required_fields = ["customer_id", "customer_name", "email"]
+    for field in required_fields:
+        if field not in event_body:
+            logger.warning(f"Missing required field: {field}")
+            return {
+                "statusCode": 400,
+                "body": json.dumps({
+                    "success": False,
+                    "error": f"Missing required field: {field}"
+                })
+            }
+
+    # SQL INSERT with RETURNING to fetch created record
+    query = """
+    INSERT INTO demo.customers
+    (customer_id, customer_name, email, city, state, created_at)
+    VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+    RETURNING customer_id, customer_name, email, city, state, created_at
+    """
+
+    # Parameter order must match query placeholders
+    params = [
+        event_body["customer_id"],
+        event_body["customer_name"],
+        event_body["email"],
+        event_body.get("city"),
+        event_body.get("state")
+    ]
+
+    result = invoke_query_executor(query, params, fetch=True)
+
+    if result.get("success"):
+        logger.info(f"Customer created successfully, customer_id: {event_body['customer_id']}")
+        return {
+            "statusCode": 201,
+            "body": json.dumps({
+                "success": True,
+                "message": "Customer created successfully",
+                "data": result.get("data", [])[0] if result.get("data") else None
+            }, default=str)
+        }
+
+    logger.error(f"Failed to create customer, customer_id: {event_body['customer_id']}, error: {result.get('error')}")
+    return {
+        "statusCode": 500,
+        "body": json.dumps({
+            "success": False,
+            "error": result.get("error", "Unknown error")
+        })
+    }
+
+
+# ---------------------------------------------------------
+# GET /customers
+# ---------------------------------------------------------
+
+def get_customers(query_params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fetches customers.
+
+    Endpoint
+    --------
+    GET /customers
+    GET /customers?customer_id=CUST001
+
+    Behavior
+    --------
+    - If customer_id is provided → fetch single customer
+    - Else → fetch all customers ordered by creation date
+    """
+
+    customer_id = query_params.get("customer_id")
+    logger.info(f"Fetching customers, customer_id: {customer_id}, type: {'single' if customer_id else 'all'}")
+
+    if customer_id:
+        query = """
+        SELECT customer_id, customer_name, email, city, state, created_at
+        FROM demo.customers
+        WHERE customer_id = %s
+        """
+        params = [customer_id]
+    else:
+        query = """
+        SELECT customer_id, customer_name, email, city, state, created_at
+        FROM demo.customers
+        ORDER BY created_at DESC
+        """
+        params = []
+
+    logger.info(f"Executing query: {query}")
+
+    result = invoke_query_executor(query, params, fetch=True)
+
+    if result.get("success"):
+        data = result.get("data", [])
+        logger.info(f"Customers fetched successfully, customer_id: {customer_id}, count: {len(data)}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "success": True,
+                "data": data,
+                "count": len(data)
+            }, default=str)
+        }
+
+    logger.error(f"Failed to fetch customers, customer_id: {customer_id}, error: {result.get('error')}")
+    return {
+        "statusCode": 500,
+        "body": json.dumps({
+            "success": False,
+            "error": result.get("error", "Unknown error")
+        })
+    }
+
+
+# ---------------------------------------------------------
+# PUT /customers/{customer_id}
+# ---------------------------------------------------------
+
+def update_customer(customer_id: str, event_body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Updates an existing customer.
+
+    Endpoint
+    --------
+    PUT /customers/{customer_id}
+
+    Notes
+    -----
+    - Only provided fields are updated
+    - Dynamic SQL is constructed safely using placeholders
+    """
+
+    logger.info(f"Updating customer, customer_id: {customer_id}, fields: {list(event_body.keys())}")
+
+    if not customer_id:
+        logger.warning("Update attempted without customer_id")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({
+                "success": False,
+                "error": "customer_id is required"
+            })
+        }
+
+    update_fields = []
+    params = []
+
+    # Build update fields dynamically
+    for field in ["customer_name", "email", "city", "state"]:
+        if field in event_body:
+            update_fields.append(f"{field} = %s")
+            params.append(event_body[field])
+
+    if not update_fields:
+        logger.warning(f"No fields to update for customer_id: {customer_id}")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({
+                "success": False,
+                "error": "No fields to update"
+            })
+        }
+
+    # customer_id is always last param
+    params.append(customer_id)
+
+    query = f"""
+    UPDATE demo.customers
+    SET {', '.join(update_fields)}
+    WHERE customer_id = %s
+    RETURNING customer_id, customer_name, email, city, state, created_at
+    """
+
+    logger.info(f"Executing update query: {query}, params: {params}")
+
+    result = invoke_query_executor(query, params, fetch=True)
+
+    if result.get("success"):
+        if result.get("rowcount", 0) == 0:
+            logger.warning(f"Customer not found for update, customer_id: {customer_id}")
+            return {
+                "statusCode": 404,
+                "body": json.dumps({
+                    "success": False,
+                    "error": f"Customer {customer_id} not found"
+                })
+            }
+
+        logger.info(f"Customer updated successfully, customer_id: {customer_id}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "success": True,
+                "message": "Customer updated successfully",
+                "data": result.get("data", [])[0] if result.get("data") else None
+            }, default=str)
+        }
+
+    logger.error(f"Failed to update customer, customer_id: {customer_id}, error: {result.get('error')}")
+    return {
+        "statusCode": 500,
+        "body": json.dumps({
+            "success": False,
+            "error": result.get("error", "Unknown error")
+        })
+    }
+
+
+# ---------------------------------------------------------
+# DELETE /customers/{customer_id}
+# ---------------------------------------------------------
+
+def delete_customer(customer_id: str) -> Dict[str, Any]:
+    """
+    Deletes a customer.
+
+    Safety Checks
+    -------------
+    - Prevents deletion if customer has existing orders
+    """
+
+    logger.info(f"Deleting customer, customer_id: {customer_id}")
+
+    if not customer_id:
+        logger.warning("Delete attempted without customer_id")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({
+                "success": False,
+                "error": "customer_id is required"
+            })
+        }
+
+    # Referential integrity check
+    logger.info(f"Checking for existing orders for customer_id: {customer_id}")
+
+    check_query = """
+    SELECT COUNT(*) AS order_count
+    FROM demo.orders
+    WHERE customer_id = %s
+    """
+
+    check_result = invoke_query_executor(check_query, [customer_id], fetch=True)
+
+    if check_result.get("success") and check_result.get("data"):
+        order_count = check_result["data"][0].get("order_count", 0)
+        logger.info(f"Order count check completed, customer_id: {customer_id}, order_count: {order_count}")
+
+        if order_count > 0:
+            logger.warning(f"Delete blocked - customer has existing orders, customer_id: {customer_id}, order_count: {order_count}")
+            return {
+                "statusCode": 400,
+                "body": json.dumps({
+                    "success": False,
+                    "error": "Cannot delete customer with existing orders"
+                })
+            }
+
+    delete_query = """
+    DELETE FROM demo.customers
+    WHERE customer_id = %s
+    """
+
+    logger.info(f"Executing delete query: {delete_query}, customer_id: {customer_id}")
+
+    result = invoke_query_executor(delete_query, [customer_id], fetch=False)
+
+    if result.get("success"):
+        logger.info(f"Customer deleted successfully, customer_id: {customer_id}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "success": True,
+                "message": f"Customer {customer_id} deleted successfully"
+            })
+        }
+
+    logger.error(f"Failed to delete customer, customer_id: {customer_id}, error: {result.get('error')}")
+    return {
+        "statusCode": 500,
+        "body": json.dumps({
+            "success": False,
+            "error": result.get("error", "Unknown error")
+        })
+    }
+
+
+# ---------------------------------------------------------
+# Lambda Entry Point
+# ---------------------------------------------------------
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    AWS Lambda entry point.
+
+    Responsibilities
+    ----------------
+    - Parse API Gateway request
+    - Route based on HTTP method
+    - Attach CORS headers
+    - Handle unexpected exceptions safely
+    """
+
+    logger.info("Lambda invocation started")
+
+    try:
+        http_method = event.get(
+            "httpMethod",
+            event.get("requestContext", {}).get("http", {}).get("method")
+        )
+
+        path_parameters = event.get("pathParameters") or {}
+        query_parameters = event.get("queryStringParameters") or {}
+
+        logger.info(f"Request received, method: {http_method}, path: {event.get('path')}, query_params: {query_parameters}")
+
+        body = {}
+        if event.get("body"):
+            try:
+                body = json.loads(event["body"])
+                logger.info(f"Request body parsed, keys: {list(body.keys())}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in request body, error: {str(e)}")
+                return {
+                    "statusCode": 400,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Access-Control-Allow-Origin": "*"
+                    },
+                    "body": json.dumps({
+                        "success": False,
+                        "error": "Invalid JSON in request body"
+                    })
+                }
+
+        # Route requests
+        logger.info(f"Routing request, method: {http_method}")
+
+        if http_method == "POST":
+            response = create_customer(body)
+        elif http_method == "GET":
+            response = get_customers(query_parameters)
+        elif http_method == "PUT":
+            response = update_customer(
+                query_parameters.get("customer_id") or query_parameters.get("id"),
+                body
+            )
+        elif http_method == "DELETE":
+            response = delete_customer(
+                query_parameters.get("customer_id") or query_parameters.get("id")
+            )
+        else:
+            logger.warning(f"Unsupported HTTP method: {http_method}")
+            response = {
+                "statusCode": 405,
+                "body": json.dumps({
+                    "success": False,
+                    "error": f"Method {http_method} not allowed"
+                })
+            }
+
+        # Add standard CORS headers
+        response.setdefault("headers", {})
+        response["headers"].update({
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type"
+        })
+
+        logger.info(f"Lambda invocation completed, status_code: {response.get('statusCode')}")
+
+        return response
+
+    except Exception as e:
+        logger.error(f"Unhandled exception in lambda_handler, error: {str(e)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
+
+        return {
+            "statusCode": 500,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "success": False,
+                "error": str(e)
+            })
+        }
+
+generic-query-executor:
+"""
+Generic Query Executor Lambda
+=============================
+
+This Lambda function acts as a **database access layer** for all application
+Lambdas. It executes parameterized SQL queries against an RDS PostgreSQL
+database using credentials stored securely in AWS Secrets Manager.
+
+Architecture Role
+-----------------
+Business Lambda (Customers, Orders, etc.)
+    -> Generic Query Executor Lambda (this file)
+        -> RDS PostgreSQL
+
+Why this design?
+----------------
+- Centralized database access & security
+- Reusable query execution logic
+- Simplified IAM and secrets handling
+- Connection pooling for performance optimization
+"""
+
+import json
+import os
+import boto3
+import logging
+import traceback
+from botocore.exceptions import ClientError
+import psycopg2
+from psycopg2 import pool
+from typing import Dict, Any, Optional
+
+# ---------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# ---------------------------------------------------------
+# Global State (Reused Across Lambda Invocations)
+# ---------------------------------------------------------
+
+# PostgreSQL connection pool (created once per warm Lambda)
+connection_pool = None
+
+# Cached DB credentials to avoid repeated Secrets Manager calls
+cached_credentials = None
+
+# ---------------------------------------------------------
+# Secrets Manager Integration
+# ---------------------------------------------------------
+
+def get_secret(secret_name: str) -> Dict[str, Any]:
+    """
+    Retrieve database credentials from AWS Secrets Manager.
+
+    This function:
+    - Fetches credentials only once per Lambda container
+    - Caches them in memory for subsequent invocations
+
+    Args
+    ----
+    secret_name : str
+        Name of the secret in AWS Secrets Manager
+
+    Returns
+    -------
+    Dict[str, Any]
+        Parsed JSON secret containing DB credentials
+
+    Raises
+    ------
+    Exception
+        If secret retrieval or parsing fails
+    """
+    global cached_credentials
+
+    # Return cached credentials if already loaded
+    if cached_credentials:
+        logger.info(f"Using cached credentials for secret: {secret_name}")
+        return cached_credentials
+
+    logger.info(f"Fetching credentials from Secrets Manager, secret: {secret_name}, region: {os.environ.get('AWS_REGION', 'us-east-1')}")
+
+    # Create Secrets Manager client
+    session = boto3.session.Session()
+    client = session.client(
+        service_name="secretsmanager",
+        region_name=os.environ.get("AWS_REGION", "us-east-1")
+    )
+
+    try:
+        response = client.get_secret_value(SecretId=secret_name)
+        logger.info(f"Successfully retrieved secret: {secret_name}")
+
+    except ClientError as e:
+        # Explicit handling of Secrets Manager failure scenarios
+        error_code = e.response["Error"]["Code"]
+        logger.error(f"Failed to retrieve secret: {secret_name}, error_code: {error_code}, error: {str(e)}, trace: {traceback.format_exc()}")
+
+        if error_code == "DecryptionFailureException":
+            raise Exception("Secrets Manager cannot decrypt the secret")
+        elif error_code == "InternalServiceErrorException":
+            raise Exception("Secrets Manager internal service error")
+        elif error_code == "InvalidParameterException":
+            raise Exception("Invalid parameter while fetching secret")
+        elif error_code == "InvalidRequestException":
+            raise Exception("Invalid request to Secrets Manager")
+        elif error_code == "ResourceNotFoundException":
+            raise Exception(f"Secret '{secret_name}' not found")
+        else:
+            raise Exception(f"Unexpected Secrets Manager error: {str(e)}")
+
+    # Secrets Manager returns secrets either as string or binary
+    if "SecretString" in response:
+        secret = json.loads(response["SecretString"])
+        cached_credentials = secret  # Cache for reuse
+        logger.info(f"Secret parsed and cached, secret: {secret_name}")
+        return secret
+
+    logger.error(f"Unsupported secret format (binary), secret: {secret_name}")
+    raise Exception("Unsupported secret format (binary secret)")
+
+
+# ---------------------------------------------------------
+# Database Connection Pool Management
+# ---------------------------------------------------------
+
+def get_db_connection():
+    """
+    Acquire a database connection from the pool.
+
+    Behavior
+    --------
+    - Initializes a PostgreSQL connection pool on first invocation
+    - Reuses pooled connections for subsequent calls
+
+    Returns
+    -------
+    psycopg2.connection
+        Active database connection
+    """
+    global connection_pool
+
+    if connection_pool is None:
+        logger.info("Initializing database connection pool")
+
+        # Secret name must be provided via environment variable
+        secret_name = os.environ.get("DB_SECRET_NAME")
+        if not secret_name:
+            logger.error("DB_SECRET_NAME environment variable not set")
+            raise Exception("DB_SECRET_NAME environment variable is not set")
+
+        # Fetch DB credentials securely
+        credentials = get_secret(secret_name)
+
+        db_host = credentials.get("host", os.environ.get("DB_HOST"))
+        db_name = credentials.get("dbname", "postgres")
+        db_user = credentials.get("username", os.environ.get("DB_USER"))
+        db_port = credentials.get("port", os.environ.get("DB_PORT", "5432"))
+
+        logger.info(f"Creating connection pool, host: {db_host}, database: {db_name}, user: {db_user}, port: {db_port}")
+
+        try:
+            # Initialize PostgreSQL connection pool
+            connection_pool = psycopg2.pool.SimpleConnectionPool(
+                minconn=1,
+                maxconn=10,
+                host=db_host,
+                database=db_name,
+                user=db_user,
+                password=credentials["password"],  # MUST come from secret
+                port=db_port
+            )
+
+            logger.info(f"Connection pool created successfully, host: {db_host}, database: {db_name}")
+
+        except Exception as e:
+            logger.error(f"Failed to create connection pool, host: {db_host}, database: {db_name}, error: {str(e)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
+            raise
+
+    logger.info("Acquiring connection from pool")
+
+    try:
+        conn = connection_pool.getconn()
+        logger.info(f"Connection acquired successfully, connection_id: {id(conn)}")
+        return conn
+    except Exception as e:
+        logger.error(f"Failed to acquire connection from pool, error: {str(e)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
+        raise
+
+
+def return_db_connection(conn):
+    """
+    Return a database connection back to the pool.
+
+    This ensures connections are reused efficiently and
+    prevents connection leaks.
+    """
+    global connection_pool
+
+    if connection_pool and conn:
+        logger.info(f"Returning connection to pool, connection_id: {id(conn)}")
+        connection_pool.putconn(conn)
+
+
+# ---------------------------------------------------------
+# Core Query Execution Logic
+# ---------------------------------------------------------
+
+def execute_query(
+    query: str,
+    params: Optional[tuple] = None,
+    fetch: bool = True
+) -> Dict[str, Any]:
+    """
+    Execute a SQL query against PostgreSQL.
+
+    Supports:
+    - SELECT queries (fetch=True)
+    - INSERT / UPDATE / DELETE (fetch=False or RETURNING)
+
+    Args
+    ----
+    query : str
+        SQL query with parameter placeholders (%s)
+    params : tuple, optional
+        Query parameters
+    fetch : bool
+        Whether to fetch and return query results
+
+    Returns
+    -------
+    Dict[str, Any]
+        {
+            "success": bool,
+            "rowcount": int,
+            "data": list | None,
+            "error": str (optional)
+        }
+    """
+    conn = None
+    cursor = None
+
+    logger.info(f"Executing query: {query}, params: {params}, fetch: {fetch}")
+
+    try:
+        # Acquire DB connection
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        logger.info(f"Executing SQL statement: {query}")
+
+        # Execute parameterized query (prevents SQL injection)
+        cursor.execute(query, params)
+
+        logger.info(f"SQL statement executed, query: {query}, rowcount: {cursor.rowcount}")
+
+        result = {
+            "success": True,
+            "rowcount": cursor.rowcount
+        }
+
+        # Handle SELECT / RETURNING queries
+        if fetch and cursor.description:
+            columns = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+
+            # Convert rows into list of dictionaries
+            result["data"] = [dict(zip(columns, row)) for row in rows]
+
+            logger.info(f"Query results fetched, query: {query}, rowcount: {cursor.rowcount}, result_count: {len(result['data'])}, columns: {columns}")
+        else:
+            result["data"] = None
+
+        # Always commit the transaction after successful execution
+        conn.commit()
+        logger.info(f"Transaction committed, query: {query}, rowcount: {cursor.rowcount}")
+
+        return result
+
+    except psycopg2.Error as e:
+        # Roll back transaction on DB errors
+        if conn:
+            conn.rollback()
+            logger.info(f"Transaction rolled back, query: {query}")
+
+        logger.error(f"Database error during query execution, query: {query}, params: {params}, error: {str(e)}, error_code: {getattr(e, 'pgcode', None)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
+
+        return {
+            "success": False,
+            "error": str(e),
+            "error_code": getattr(e, "pgcode", None)
+        }
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+            logger.info(f"Transaction rolled back, query: {query}")
+
+        logger.error(f"Unexpected error during query execution, query: {query}, params: {params}, error: {str(e)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
+
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+    finally:
+        # Always clean up resources
+        if cursor:
+            logger.info(f"Closing cursor for query: {query}")
+            cursor.close()
+        if conn:
+            return_db_connection(conn)
+
+
+# ---------------------------------------------------------
+# Lambda Entry Point
+# ---------------------------------------------------------
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    AWS Lambda entry point.
+
+    Expected Event Payload
+    ----------------------
+    {
+        "query": "SELECT * FROM demo.customers WHERE customer_id = %s",
+        "params": ["CUST001"],
+        "fetch": true
+    }
+
+    Environment Variables
+    ---------------------
+    - DB_SECRET_NAME : Secrets Manager secret name
+    - AWS_REGION     : AWS region (optional)
+
+    Returns
+    -------
+    API Gateway–compatible HTTP response
+    """
+
+    logger.info("Lambda invocation started")
+
+    try:
+        # Support both API Gateway and direct Lambda invocation
+        if isinstance(event.get("body"), str):
+            logger.info("Parsing API Gateway request body")
+            body = json.loads(event["body"])
+        else:
+            logger.info("Using direct Lambda invocation payload")
+            body = event
+
+        query = body.get("query")
+        params = body.get("params")
+        fetch = body.get("fetch", True)
+
+        logger.info(f"Request parsed, query: {query}, params: {params}, fetch: {fetch}")
+
+        # Input validation
+        if not query:
+            logger.warning("Query validation failed - query is required")
+            return {
+                "statusCode": 400,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*"
+                },
+                "body": json.dumps({
+                    "success": False,
+                    "error": "Query is required"
+                })
+            }
+
+        # Convert params list to tuple for psycopg2
+        if params and isinstance(params, list):
+            params = tuple(params)
+            logger.info(f"Converted params list to tuple, param_count: {len(params)}")
+
+        # Execute SQL query
+        result = execute_query(query, params, fetch)
+
+        status_code = 200 if result["success"] else 500
+
+        logger.info(f"Lambda invocation completed, status_code: {status_code}, success: {result['success']}, rowcount: {result.get('rowcount')}")
+
+        return {
+            "statusCode": status_code,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps(result, default=str)
+        }
+
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error, error: {str(e)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
+
+        return {
+            "statusCode": 400,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "success": False,
+                "error": f"Invalid JSON payload: {str(e)}"
+            })
+        }
+
+    except Exception as e:
+        logger.error(f"Unhandled exception in lambda_handler, error: {str(e)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
+
+        return {
+            "statusCode": 500,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "success": False,
+                "error": str(e)
+            })
+        }
+
+I want to replace orders api and customers api with LLM and prompt engineering. Can you help me with that?
+
+Output: I need to end to end implementation of llm with prompt engg considering openai as the LLM provider 

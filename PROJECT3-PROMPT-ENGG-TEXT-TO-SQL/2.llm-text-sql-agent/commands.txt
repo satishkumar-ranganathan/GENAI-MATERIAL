@@ -1,0 +1,25 @@
+export AWS_REGION="us-west-2"
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+docker tag llm-api:latest $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/llm-api:latest
+docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/llm-api:latest
+
+Create one lambda fn with above image 
+
+configure below environment variables in the lamdba function 
+
+SECRET_NAME="llm-secrets"
+AWS_REGION_NAME="us-west-2"
+
+configure llm-secrets with below 
+
+{
+  "OPENAI_API_KEY": "your-openai-key",
+  "OPENAI_MODEL": "gpt-4o-mini",
+  "QUERY_EXECUTOR_FUNCTION": "generic-query-executor"
+}
+
+expose the lambda with functional url 
+
+https://h2hyz4mqjmlrp5fjhdpj65hiji0dxbyo.lambda-url.us-west-2.on.aws/
+
+

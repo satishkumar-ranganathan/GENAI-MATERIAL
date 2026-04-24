@@ -1,0 +1,11 @@
+# OpenAI SDK
+openai>=1.0.0
+
+# AWS SDK (already available in Lambda, but keep for local dev)
+boto3>=1.28.0
+
+# PostgreSQL driver (needed ONLY for generic-query-executor lambda)
+psycopg2-binary>=2.9.9
+
+# Optional: Better typing support (dev)
+typing-extensions>=4.5.0
