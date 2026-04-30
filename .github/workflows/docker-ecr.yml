@@ -1,4 +1,4 @@
-name: Deploy Travel Agent
+name: Deploy Travel Stack to ECR
 
 on:
   push:
@@ -13,8 +13,17 @@ permissions:
 
 jobs:
   build-and-push:
-    name: Build and Push to ECR
+    name: Build and Push
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Define both services here to run in parallel
+        service: [langgraph-agent, chat-assistant]
+        include:
+          - service: langgraph-agent
+            repo: langgraph-agent
+          - service: chat-assistant
+            repo: chat-assistant-ui
 
     steps:
       - name: Checkout Code
@@ -31,19 +40,18 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, Tag, and Push Image
-        id: build-image
+      - name: Build, Tag, and Push ${{ matrix.service }}
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: 'langgraph-agent'
+          ECR_REPOSITORY: ${{ matrix.repo }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          # Navigate to the context directory
-          cd TRAVEL-LANGGRAPH-AGENT/langgraph-agent
+          # Navigate to the specific service directory
+          cd TRAVEL-LANGGRAPH-AGENT/${{ matrix.service }}
           
-          # Build once with multiple tags
+          # Build and tag
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
           
-          # Push both tags
+          # Push to ECR
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
