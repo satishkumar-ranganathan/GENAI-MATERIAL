@@ -1,7 +1,8 @@
 fastapi
 uvicorn
-langchain
-langgraph
 langchain-openai
+langgraph
 langchain-community
+google-search-results
 requests
+python-dotenv

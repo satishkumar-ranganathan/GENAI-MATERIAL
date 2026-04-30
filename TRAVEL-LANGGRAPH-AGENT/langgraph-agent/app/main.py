@@ -1,29 +1,27 @@
-from fastapi import FastAPI
-from app.graph import build_graph
+from fastapi import FastAPI, Body
+from app.graph import graph
 
 app = FastAPI()
-graph = build_graph()
 
+@app.post("/chat")
+async def chat(payload: dict = Body(...)):
+    thread_id = payload.get("thread_id", "session_1")
+    config = {"configurable": {"thread_id": thread_id}}
+    action = payload.get("action") # "start", "select_prices", or "fix_budget"
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+    if action == "start":
+        inputs = payload.get("data") # {origin, destination, date, budget}
+        graph.invoke(inputs, config)
+    
+    elif action == "select_prices":
+        # Replaces your input("\nChosen flight price: ")
+        graph.update_state(config, payload.get("data"))
+        graph.invoke(None, config)
 
+    elif action == "fix_budget":
+        # Replaces your budget deficit choice logic
+        graph.update_state(config, payload.get("data"))
+        graph.update_state(config, {}, as_node="supervisor")
+        graph.invoke(None, config)
 
-@app.post("/plan")
-def plan_trip(payload: dict):
-    config = {
-        "configurable": {
-            "thread_id": payload.get("session_id", "default")
-        }
-    }
-
-    result = graph.invoke({
-        "origin": payload["origin"],
-        "destination": payload["destination"],
-        "travel_date_input": payload["date"],
-        "total_budget": payload["budget"],
-        "messages": []
-    }, config)
-
-    return result
+    return graph.get_state(config).values
