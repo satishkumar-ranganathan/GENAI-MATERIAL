@@ -172,7 +172,8 @@ async def process_agent_response(res_data):
 async def on_flight(action: cl.Action):
     price = float(action.payload["price"])
     # Get current budget from the session we tracked in handle_message
-    current_data = cl.user_session.get("travel_data", {})
+    print(current_data)
+    current_data = cl.user_session.get("travel_data") or {}
     total_budget = current_data.get("total_budget", 0)
 
     # UI-SIDE VALIDATION (Shift-Left)
