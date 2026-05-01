@@ -171,8 +171,20 @@ async def process_agent_response(res_data):
 @cl.action_callback("select_flight")
 async def on_flight(action: cl.Action):
     price = float(action.payload["price"])
-    payload = {"thread_id": cl.user_session.get("thread_id"), "action": "select_prices", "data": {"selected_flight_price": price}}
-    await cl.Message(content=f"✈️ Flight selected: ${price}. Finding hotels...").send()
+    # Get current budget from the session we tracked in handle_message
+    current_data = cl.user_session.get("travel_data", {})
+    total_budget = current_data.get("total_budget", 0)
+
+    # UI-SIDE VALIDATION (Shift-Left)
+    if total_budget and price > total_budget:
+        await cl.Message(content=f"⚠️ This flight (${price}) exceeds your total budget (${total_budget}). Please pick another or increase your budget first.").send()
+        return
+
+    payload = {
+        "thread_id": cl.user_session.get("thread_id"), 
+        "action": "select_prices", 
+        "data": {"selected_flight_price": price}
+    }
     res = await call_agent(payload)
     await process_agent_response(res)
 
