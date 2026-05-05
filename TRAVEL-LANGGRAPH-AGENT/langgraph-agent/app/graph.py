@@ -5,9 +5,12 @@ from langgraph.graph import END, StateGraph
 
 from app.config import (
     CHECKPOINTER_TYPE,
+    LANGGRAPH_POSTGRES_POOL_MAX_LIFETIME,
     LANGGRAPH_POSTGRES_POOL_MAX_IDLE,
     LANGGRAPH_POSTGRES_POOL_MAX_SIZE,
     LANGGRAPH_POSTGRES_POOL_MIN_SIZE,
+    LANGGRAPH_POSTGRES_POOL_MODE,
+    LANGGRAPH_POSTGRES_POOL_TIMEOUT,
     LANGGRAPH_POSTGRES_SETUP,
     LANGGRAPH_POSTGRES_URI,
     logger,
@@ -38,20 +41,33 @@ def _build_checkpointer():
 
         from langgraph.checkpoint.postgres import PostgresSaver
         from psycopg.rows import dict_row
-        from psycopg_pool import ConnectionPool
+        from psycopg_pool import ConnectionPool, NullConnectionPool
 
-        pool = ConnectionPool(
-            conninfo=LANGGRAPH_POSTGRES_URI,
-            min_size=LANGGRAPH_POSTGRES_POOL_MIN_SIZE,
-            max_size=LANGGRAPH_POSTGRES_POOL_MAX_SIZE,
-            max_idle=LANGGRAPH_POSTGRES_POOL_MAX_IDLE,
-            kwargs={
+        pool_kwargs = {
+            "conninfo": LANGGRAPH_POSTGRES_URI,
+            "max_size": LANGGRAPH_POSTGRES_POOL_MAX_SIZE,
+            "timeout": LANGGRAPH_POSTGRES_POOL_TIMEOUT,
+            "check": ConnectionPool.check_connection,
+            "kwargs": {
                 "autocommit": True,
                 "prepare_threshold": 0,
                 "row_factory": dict_row,
             },
-            open=True,
-        )
+            "open": True,
+        }
+
+        if LANGGRAPH_POSTGRES_POOL_MODE == "pooled":
+            pool = ConnectionPool(
+                **pool_kwargs,
+                min_size=LANGGRAPH_POSTGRES_POOL_MIN_SIZE,
+                max_idle=LANGGRAPH_POSTGRES_POOL_MAX_IDLE,
+                max_lifetime=LANGGRAPH_POSTGRES_POOL_MAX_LIFETIME,
+            )
+        elif LANGGRAPH_POSTGRES_POOL_MODE == "null":
+            pool = NullConnectionPool(**pool_kwargs)
+        else:
+            raise RuntimeError("LANGGRAPH_POSTGRES_POOL_MODE must be 'null' or 'pooled'")
+
         _exit_stack.callback(pool.close)
 
         checkpointer = PostgresSaver(pool)
@@ -59,10 +75,10 @@ def _build_checkpointer():
             logger.info("Running LangGraph Postgres checkpointer setup")
             checkpointer.setup()
         logger.info(
-            "Using Postgres checkpointer for LangGraph state with pool min=%s max=%s max_idle=%s",
-            LANGGRAPH_POSTGRES_POOL_MIN_SIZE,
+            "Using Postgres checkpointer with %s pool max=%s timeout=%s",
+            LANGGRAPH_POSTGRES_POOL_MODE,
             LANGGRAPH_POSTGRES_POOL_MAX_SIZE,
-            LANGGRAPH_POSTGRES_POOL_MAX_IDLE,
+            LANGGRAPH_POSTGRES_POOL_TIMEOUT,
         )
         return checkpointer
 

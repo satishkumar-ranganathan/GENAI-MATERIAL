@@ -12,13 +12,26 @@ def _config(thread_id: str) -> dict:
     return {"configurable": {"thread_id": thread_id}}
 
 
+def _run_with_checkpoint_retry(operation_name: str, func):
+    try:
+        return func()
+    except Exception as exc:
+        message = str(exc).lower()
+        is_connection_error = "connection is closed" in message or "ssl connection has been closed" in message
+        if not is_connection_error:
+            raise
+        logger.warning("Retrying %s after stale Postgres checkpoint connection: %s", operation_name, exc)
+        return func()
+
+
 def _state(thread_id: str) -> dict:
-    return dict(graph.get_state(_config(thread_id)).values or {})
+    snapshot = _run_with_checkpoint_retry("get_state", lambda: graph.get_state(_config(thread_id)))
+    return dict(snapshot.values or {})
 
 
 def _merge_state(thread_id: str, updates: dict) -> dict:
     config = _config(thread_id)
-    graph.update_state(config, updates)
+    _run_with_checkpoint_retry("update_state", lambda: graph.update_state(config, updates))
     return _state(thread_id)
 
 
@@ -109,7 +122,7 @@ async def chat(payload: dict = Body(...)):
                 "activities": [],
                 "data_source_notes": [],
             }
-            graph.invoke(initial_state, config)
+            _run_with_checkpoint_retry("invoke", lambda: graph.invoke(initial_state, config))
 
         elif action == "select_prices":
             if not data:

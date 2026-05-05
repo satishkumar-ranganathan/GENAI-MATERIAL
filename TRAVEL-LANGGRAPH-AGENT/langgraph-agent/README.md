@@ -35,14 +35,17 @@ DUFFEL_ACCESS_TOKEN=
 CHECKPOINTER_TYPE=memory
 LANGGRAPH_POSTGRES_URI=
 LANGGRAPH_POSTGRES_SETUP=false
+LANGGRAPH_POSTGRES_POOL_MODE=null
 LANGGRAPH_POSTGRES_POOL_MIN_SIZE=1
 LANGGRAPH_POSTGRES_POOL_MAX_SIZE=5
 LANGGRAPH_POSTGRES_POOL_MAX_IDLE=300
+LANGGRAPH_POSTGRES_POOL_MAX_LIFETIME=300
+LANGGRAPH_POSTGRES_POOL_TIMEOUT=30
 ```
 
 LangGraph remains the primary state store for active conversations. Every active conversation is keyed by the `thread_id` passed from the UI.
 
-For local demos, use `CHECKPOINTER_TYPE=memory`; state is available only while the backend process is alive. For production/ECS, use `CHECKPOINTER_TYPE=postgres` and provide `LANGGRAPH_POSTGRES_URI` or `DATABASE_URL` from Secrets Manager/SSM. The service uses a psycopg connection pool so idle/stale database connections can be replaced across requests. Set `LANGGRAPH_POSTGRES_SETUP=true` once to create/migrate the checkpointer tables, then set it back to `false` for normal runtime.
+For local demos, use `CHECKPOINTER_TYPE=memory`; state is available only while the backend process is alive. For production/ECS, use `CHECKPOINTER_TYPE=postgres` and provide `LANGGRAPH_POSTGRES_URI` or `DATABASE_URL` from Secrets Manager/SSM. The service uses psycopg pooling with connection health checks so stale database connections can be replaced across requests. `LANGGRAPH_POSTGRES_POOL_MODE=null` is recommended for Neon/serverless poolers because it avoids holding idle SSL sessions in the ECS task. Use `pooled` only when you control the database connection lifecycle and want persistent client-side pooling. Set `LANGGRAPH_POSTGRES_SETUP=true` once to create/migrate the checkpointer tables, then set it back to `false` for normal runtime.
 
 After confirmation, the backend writes the same full itinerary state under the generated `TRV-XXXXXX` booking reference as a LangGraph thread alias. This lets `/retrieve TRV-XXXXXX` return the complete itinerary from the configured LangGraph checkpointer without a separate file store.
 
