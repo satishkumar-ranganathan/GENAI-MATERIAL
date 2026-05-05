@@ -1,150 +1,105 @@
-# ✈️ Travel LangGraph Agent (GenAI + AWS Ready)
+# Travel LangGraph Agent
 
-A production-oriented **AI Travel Planning system** built using **LangGraph, OpenAI, Duffel API, and SerpAPI**, designed for multi-step agent orchestration and cloud deployment.
+Production-oriented AI travel planning backend for a two-service deployment:
 
-This project demonstrates how to evolve a **GenAI prototype → containerized microservice → CI/CD pipeline → AWS ECR → ECS-ready system**.
+- `langgraph-agent`: FastAPI + LangGraph backend on port `8000`
+- `chat-assistant`: Chainlit UI on port `8000`
 
----
+The UI calls the backend through `LLM_AGENT_URL`, so in ECS this should point to the backend service discovery name, internal ALB URL, or private service IP.
 
-# 🚀 Features
+## Workflow
 
-- 🧠 Multi-agent orchestration using **LangGraph**
-- ✈️ Real-time flight search using **Duffel API**
-- 🏨 Hotel discovery using **SerpAPI**
-- 🎯 Activity recommendations (SerpAPI)
-- 💰 Budget-aware decision engine
-- 🧩 Stateful graph execution with checkpointing
-- 🐳 Dockerized for production deployment
-- ☁️ AWS ECR + ECS deployment ready
-- 🔁 CI/CD pipeline using GitHub Actions
+1. User provides source, destination, date, and total budget in Chainlit.
+2. Backend normalizes the date and resolves IATA airport codes.
+3. Backend searches live flights with Duffel.
+4. Backend searches live hotels with SerpAPI Google Hotels.
+5. User selects one flight.
+6. User either selects a hotel or skips hotel planning.
+7. Backend calculates remaining budget.
+8. If budget is valid, backend searches live sightseeing recommendations with SerpAPI.
+9. User reviews the itinerary and explicitly confirms.
+10. Only after confirmation does the backend create a `TRV-XXXXXX` reference.
+11. User can retrieve the booking with `/retrieve TRV-XXXXXX`.
 
----
+If Duffel or SerpAPI keys are missing or an upstream API fails, the backend returns controlled demo fallback data and includes `data_source_notes` so the UI can disclose it. For production delivery, configure real keys and monitor those notes.
 
-# 🏗️ Architecture
-User Input
-↓
-Processor Node (IATA + Date Normalization)
-↓
-Flight Agent (Duffel API)
-↓
-Hotel Agent (SerpAPI)
-↓
-Activity Agent (SerpAPI)
-↓
-Supervisor Node (Budget Recalculation)
-↓
-Conditional Routing
-├── Budget OK → Activities → END
-└── Budget Exceeded → Warning Node → END
+## Backend Environment
 
-
----
-
-# 📁 Project Structure
-```
-TRAVEL-LANGGRAPH-AGENT/
-│
-├── langgraph-agent/
-│ ├── app/
-│ │ ├── main.py # Entry point
-│ │ ├── graph.py # LangGraph workflow
-│ │ ├── nodes.py # Agent nodes (flight, hotel, etc.)
-│ │ ├── state.py # TravelState definition
-│ │ ├── config.py # API keys + LLM setup
-│ │
-│ ├── Dockerfile
-│ ├── requirements.txt
-│ ├── README.md
-│
-├── .github/workflows/
-│ └── docker-ecr.yml # CI/CD pipeline
-
-```
----
-
-# ⚙️ Setup Instructions
-
-## 1. Clone Repository
+Create `langgraph-agent/.env` or configure these in ECS task definition secrets/environment:
 
 ```bash
-git clone <your-repo-url>
-cd TRAVEL-LANGGRAPH-AGENT/langgraph-agent
-```
-## 2. Create Virtual Environment
-
-```bash
-python -m venv venv
-source venv/bin/activate   # Mac/Linux
+OPENAI_API_KEY=
+LLM_MODEL=gpt-4o
+SERPAPI_API_KEY=
+DUFFEL_ACCESS_TOKEN=
+BOOKING_STORE_PATH=/tmp/travel_bookings.json
 ```
 
-## 3. Install Dependencies
+LangGraph `MemorySaver` remains the primary state store for active conversations. Every active conversation is keyed by the `thread_id` passed from the UI, and it is available as long as the backend ECS task is running.
+
+The booking store is only a secondary lookup for completed bookings after the user confirms. For booking retrieval across ECS task restarts, mount an EFS volume and set `BOOKING_STORE_PATH` to a file path on that volume. For a higher scale production system, replace the file store with DynamoDB or Postgres.
+
+## UI Environment
+
+Create `chat-assistant/.env` or configure these in ECS:
+
 ```bash
+OPENAI_API_KEY=
+LLM_MODEL=gpt-4o-mini
+LLM_AGENT_URL=http://<backend-service-or-alb>:8000/chat
+```
+
+## Local Run
+
+Backend:
+
+```bash
+cd langgraph-agent
 pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-## 4. Configure Environment Variables
+UI:
 
 ```bash
-Create a .env file:
-OPENAI_API_KEY=your_openai_key
-SERPAPI_API_KEY=your_serpapi_key
-DUFFEL_ACCESS_TOKEN=your_duffel_token
-```
-## 5. Run Application
-```bash
-python app/main.py
+cd chat-assistant
+pip install -r requirements.txt
+chainlit run app.py --host 0.0.0.0 --port 8000
 ```
 
-🐳 Docker Setup
+Run the UI on a different local port if both services are on one machine.
 
-## Build Image
+## Docker Build
+
+Backend:
+
 ```bash
+cd langgraph-agent
 docker build -t travel-langgraph-agent .
 ```
 
-## Run Container
-```bash
-docker run -e OPENAI_API_KEY=xxx \
-           -e SERPAPI_API_KEY=xxx \
-           -e DUFFEL_ACCESS_TOKEN=xxx \
-           travel-langgraph-agent
-```
-## ☁️ AWS ECR Deployment
+UI:
 
 ```bash
-1. Create ECR Repository
-aws ecr create-repository \
-  --repository-name travel-langgraph-agent \
-  --region us-east-1
-2. Login to ECR
-aws ecr get-login-password --region us-east-1 \
-| docker login --username AWS --password-stdin <account_id>.dkr.ecr.us-east-1.amazonaws.com
-3. Tag Docker Image
-docker tag travel-langgraph-agent:latest \
-<account_id>.dkr.ecr.us-east-1.amazonaws.com/travel-langgraph-agent:latest
-4. Push Image
-docker push <account_id>.dkr.ecr.us-east-1.amazonaws.com/travel-langgraph-agent:latest
+cd chat-assistant
+docker build -t travel-chat-assistant .
 ```
 
-🔁 CI/CD Pipeline (GitHub Actions)
+## ECS Notes
 
-On every push to main, the workflow will:
+- Put the backend and UI in the same VPC/security group path.
+- Allow the UI task to reach backend port `8000`.
+- Set `LLM_AGENT_URL` in the UI task to the backend service endpoint.
+- Use Secrets Manager or SSM Parameter Store for API keys.
+- Configure CloudWatch logs for both services.
+- Add health checks:
+  - Backend: `GET /health`
+  - UI: Chainlit root path or container health check at the load balancer level
 
-Build Docker image
-Authenticate with AWS
-Tag image
-Push to ECR
+## Recommended Production Improvements
 
-Workflow file:
-
-.github/workflows/docker-ecr.yml
-🔐 GitHub Secrets Required
-
-Add these in GitHub:
-
-Secret Name	Description
-AWS_ACCESS_KEY_ID	IAM access key
-AWS_SECRET_ACCESS_KEY	IAM secret key
-AWS_REGION	AWS region (e.g. us-east-1)
-AWS_ACCOUNT_ID	AWS account ID
-ECR_REPOSITORY	travel-langgraph-agent
+- Replace file-based booking storage with DynamoDB or Postgres.
+- Add authentication before exposing booking retrieval publicly.
+- Add request/response tracing with a correlation ID.
+- Add unit tests with mocked Duffel and SerpAPI responses.
+- Add retry/backoff for upstream provider failures.

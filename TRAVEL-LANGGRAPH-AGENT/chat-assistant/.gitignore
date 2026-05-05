@@ -1,5 +1,5 @@
 .venv/
-app/__pycache__/
+venv/
 __pycache__/
 *.py[cod]
 .env
@@ -8,5 +8,4 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-travel_bookings.json
 *.log

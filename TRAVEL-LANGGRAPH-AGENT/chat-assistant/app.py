@@ -1,234 +1,343 @@
+import json
+import logging
+import os
+import re
+import sys
+
 import chainlit as cl
 import httpx
-import os
-import logging
-import sys
-import json
 from langchain_openai import ChatOpenAI
 
-# =========================================================
-# LOGGING & CONFIG
-# =========================================================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("TRAVEL_UI")
 
-LLM_AGENT_URL = os.environ.get("LLM_AGENT_URL", "http://your-ecs-agent:8000/chat")
+LLM_AGENT_URL = os.environ.get("LLM_AGENT_URL", "http://localhost:8000/chat")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 
-llm = ChatOpenAI(
-    model="gpt-4o-mini", 
-    temperature=0,
-    api_key=os.environ.get("OPENAI_API_KEY")
-)
 
-# =========================================================
-# UTILITY FUNCTIONS
-# =========================================================
+def _llm():
+    if not OPENAI_API_KEY:
+        return None
+    return ChatOpenAI(model=LLM_MODEL, temperature=0, api_key=OPENAI_API_KEY)
+
+
+def _extract_budget(text: str):
+    match = re.search(r"(?:budget|under|below|around|usd|\$)\s*\$?\s*(\d+(?:,\d{3})*(?:\.\d+)?)", text, re.I)
+    if not match:
+        match = re.search(r"\$\s*(\d+(?:,\d{3})*(?:\.\d+)?)", text)
+    return float(match.group(1).replace(",", "")) if match else None
+
 
 async def parse_user_request(text: str):
-    """Extracts entities and identifies missing fields."""
     prompt = f"""
-    Extract travel details from the user's request. 
-    User Request: "{text}"
-    
-    Return ONLY a JSON object with:
-    - origin (string or "unknown")
-    - destination (string or "unknown")
-    - travel_date_input (string or "unknown")
-    - total_budget (number or null)
-    
-    Rules:
-    - If a field is missing, set it to "unknown" or null.
-    - Do not guess.
-    """
+Extract travel details from the user's request.
+User Request: "{text}"
+
+Return ONLY valid JSON with:
+- origin: string or "unknown"
+- destination: string or "unknown"
+- travel_date_input: string or "unknown"
+- total_budget: number or null
+
+Rules:
+- Do not guess missing fields.
+- Keep dates as the user wrote them, for example "May 15", "next Friday", or "2026-06-01".
+"""
+    client = _llm()
+    if not client:
+        return {
+            "origin": "unknown",
+            "destination": "unknown",
+            "travel_date_input": "unknown",
+            "total_budget": _extract_budget(text),
+        }
+
     try:
-        response = await llm.ainvoke(prompt)
+        response = await client.ainvoke(prompt)
         content = response.content.strip()
-        if content.startswith("```json"): content = content[7:-3]
-        return json.loads(content.strip())
-    except Exception as e:
-        logger.error(f"Shield Parsing Error: {e}")
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.endswith("```"):
+            content = content[:-3]
+        parsed = json.loads(content.strip())
+        parsed["total_budget"] = parsed.get("total_budget") or _extract_budget(text)
+        return parsed
+    except Exception as exc:
+        logger.error("Request parsing error: %s", exc)
         return None
 
+
 async def call_agent(payload: dict):
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        logger.info(f"Calling Agent | Action: {payload.get('action')}")
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        logger.info("Calling agent action=%s", payload.get("action"))
         response = await client.post(LLM_AGENT_URL, json=payload)
-        response.raise_for_status()
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get("detail", response.text)
+            except Exception:
+                detail = response.text
+            raise RuntimeError(detail)
         return response.json()
 
-# =========================================================
-# CHAINLIT HANDLERS
-# =========================================================
+
+def _new_travel_data():
+    return {
+        "origin": "unknown",
+        "destination": "unknown",
+        "travel_date_input": "unknown",
+        "total_budget": None,
+    }
+
 
 @cl.on_chat_start
 async def start():
     cl.user_session.set("thread_id", cl.user_session.get("id"))
     cl.user_session.set("activities_shown", False)
-    await cl.Message(content="✈️ **Smart Travel Planner**\nWhere are we heading? Please include your **Source, Destination, Date, and Budget**.").send()
+    cl.user_session.set("notes_shown", False)
+    await cl.Message(
+        content=(
+            "**Smart Travel Planner**\n"
+            "Share your source city, destination, travel date, and total budget."
+        )
+    ).send()
+
 
 @cl.on_message
 async def handle_message(message: cl.Message):
     user_input = message.content.strip()
-    
-    # 1. RETRIEVE COMMAND
+
     if user_input.lower().startswith("/retrieve"):
-        parts = user_input.split(" ")
+        parts = user_input.split()
         if len(parts) < 2:
-            await cl.Message(content="⚠️ Please provide the ID. Example: `/retrieve TRV-A1B2C3`").send()
+            await cl.Message(content="Please provide the reference ID. Example: `/retrieve TRV-A1B2C3`").send()
             return
-        
-        ref_id = parts[1].strip().upper()
-        cl.user_session.set("thread_id", ref_id) # Switch context to the booking ID
-        
+
+        reference = parts[1].strip().upper()
         try:
-            res_data = await call_agent({"thread_id": ref_id, "action": "retrieve"})
-            await cl.Message(content=f"🔍 Pulling record for `{ref_id}`...").send()
+            res_data = await call_agent({"thread_id": reference, "reference": reference, "action": "retrieve"})
+            cl.user_session.set("thread_id", reference)
             await process_agent_response(res_data)
-        except Exception as e:
-            await cl.Message(content=f"❌ Could not find Reference ID: {ref_id}").send()
+        except Exception as exc:
+            await cl.Message(content=f"Could not find `{reference}`. {exc}").send()
         return
 
     thread_id = cl.user_session.get("thread_id")
 
-    # 2. Budget Adjustment Shortcut
-    if user_input.replace('.', '', 1).isdigit():
-        payload = {"thread_id": thread_id, "action": "fix_budget", "data": {"total_budget": float(user_input)}}
-        res_data = await call_agent(payload)
-        await process_agent_response(res_data)
+    if user_input.replace(".", "", 1).isdigit():
+        try:
+            res_data = await call_agent(
+                {
+                    "thread_id": thread_id,
+                    "action": "fix_budget",
+                    "data": {"total_budget": float(user_input)},
+                }
+            )
+            await process_agent_response(res_data)
+        except Exception as exc:
+            await cl.Message(content=f"Could not update budget: {exc}").send()
         return
 
-    # 3. Session Initialization (FIXED: Prevents NoneType error)
-    current_data = cl.user_session.get("travel_data")
-    if current_data is None:
-        current_data = {
-            "origin": "unknown",
-            "destination": "unknown",
-            "travel_date_input": "unknown",
-            "total_budget": None
-        }
-
-    # 4. Extract and Merge
+    current_data = cl.user_session.get("travel_data") or _new_travel_data()
     new_details = await parse_user_request(user_input)
+
     if new_details:
         for key in ["origin", "destination", "travel_date_input"]:
-            if new_details.get(key) != "unknown":
+            if new_details.get(key) and new_details.get(key) != "unknown":
                 current_data[key] = new_details[key]
-        if new_details.get("total_budget"):
-            current_data["total_budget"] = new_details["total_budget"]
+        if new_details.get("total_budget") is not None:
+            current_data["total_budget"] = float(new_details["total_budget"])
 
     cl.user_session.set("travel_data", current_data)
 
-    # 5. Missing Fields Check
     missing = []
-    if current_data["origin"] == "unknown": missing.append("Source City")
-    if current_data["destination"] == "unknown": missing.append("Destination")
-    if not current_data["total_budget"]: missing.append("Total Budget")
+    if current_data["origin"] == "unknown":
+        missing.append("source city")
+    if current_data["destination"] == "unknown":
+        missing.append("destination")
+    if current_data["travel_date_input"] == "unknown":
+        missing.append("travel date")
+    if current_data["total_budget"] is None:
+        missing.append("total budget")
 
     if missing:
-        msg = f"Got it! Still need: **{', '.join(missing)}** to start the search."
-        await cl.Message(content=msg).send()
+        await cl.Message(content=f"Got it. I still need: **{', '.join(missing)}**.").send()
         return
 
-    # 6. Start Agent Search
-    cl.user_session.set("travel_data", None) # Clear draft
-    payload = {
-        "thread_id": thread_id,
-        "action": "start",
-        "data": {
-            "origin": current_data.get("origin", "unknown"),
-            "destination": current_data.get("destination", "unknown"),
-            "travel_date_input": current_data.get("travel_date_input", "unknown"),
-            "total_budget": current_data.get("total_budget")
-        }
-    }
-    
-    await cl.Message(content=f"🚀 Searching flights from {current_data['origin']} to {current_data['destination']}...").send()
-    
-    try:
-        res_data = await call_agent(payload)
-        await process_agent_response(res_data)
-    except Exception as e:
-        await cl.Message(content=f"⚠️ Agent Error: {e}").send()
+    cl.user_session.set("travel_data", None)
+    await cl.Message(
+        content=(
+            f"Searching live options for **{current_data['origin']} -> {current_data['destination']}** "
+            f"on **{current_data['travel_date_input']}**."
+        )
+    ).send()
 
-# =========================================================
-# UI RENDERING LOGIC
-# =========================================================
+    try:
+        res_data = await call_agent({"thread_id": thread_id, "action": "start", "data": current_data})
+        await process_agent_response(res_data)
+    except Exception as exc:
+        await cl.Message(content=f"Agent error: {exc}").send()
+
+
+async def _show_source_notes(res_data):
+    notes = res_data.get("data_source_notes") or []
+    if notes and not cl.user_session.get("notes_shown"):
+        cl.user_session.set("notes_shown", True)
+        await cl.Message(content="Data note: " + " ".join(notes)).send()
+
 
 async def process_agent_response(res_data):
-    # 1. Flight Selection Buttons
-    if "flight_options" in res_data and not res_data.get("selected_flight_price"):
-        actions = [
-            cl.Action(name="select_flight", label=f"{f['info']} (${f['price']})", payload={"price": f['price']})
-            for f in res_data["flight_options"]
-        ]
-        await cl.Message(content="✈️ **Select a Flight:**", actions=actions).send()
+    await _show_source_notes(res_data)
 
-    # 2. Hotel Selection Buttons
-    elif "hotel_options" in res_data and not res_data.get("selected_hotel_price"):
-        actions = [
-            cl.Action(name="select_hotel", label=f"{h['name']} (${h['price']})", payload={"price": h['price']})
-            for h in res_data["hotel_options"]
-        ]
-        await cl.Message(content="🏨 **Select a Hotel:**", actions=actions).send()
+    if res_data.get("is_booked"):
+        ref = res_data.get("booking_reference")
+        await cl.Message(
+            content=(
+                f"Booking confirmed.\n"
+                f"Reference ID: `{ref}`\n"
+                f"Use `/retrieve {ref}` anytime to view this itinerary."
+            )
+        ).send()
 
-    # 3. Budget Alert
-    elif res_data.get("remaining_budget", 0) < 0:
-        over = abs(res_data['remaining_budget'])
-        await cl.Message(content=f"❌ **Budget Alert!**\nYou are over by **${over:.2f}**. Please enter a new total budget.").send()
+        if res_data.get("activities") and not cl.user_session.get("activities_shown"):
+            actions = [cl.Action(name="show_spots", label="View sightseeing spots", payload={})]
+            await cl.Message(content="Sightseeing recommendations are ready.", actions=actions).send()
+        return
 
-    # 4. HITL: Confirmation Before Final Booking
-    elif res_data.get("selected_hotel_price") and not res_data.get("is_booked"):
-        summary = (
-            f"### 🛡️ Final Confirmation\n"
-            f"Ready to book? Your remaining budget will be **${res_data.get('remaining_budget', 0):.2f}**."
+    if res_data.get("flight_options") and res_data.get("selected_flight_price") is None:
+        actions = []
+        for index, flight in enumerate(res_data["flight_options"]):
+            label = f"{flight.get('airline') or flight.get('info')} (${flight['price']})"
+            actions.append(
+                cl.Action(
+                    name="select_flight",
+                    label=label[:80],
+                    payload={
+                        "price": flight["price"],
+                        "info": flight.get("info") or label,
+                        "index": index,
+                    },
+                )
+            )
+        await cl.Message(content="Select a flight:", actions=actions).send()
+        return
+
+    if res_data.get("hotel_options") and res_data.get("selected_hotel_price") is None:
+        actions = [cl.Action(name="skip_hotel", label="Skip hotel", payload={})]
+        for index, hotel in enumerate(res_data["hotel_options"]):
+            rating = f" | {hotel.get('rating')} stars" if hotel.get("rating") else ""
+            label = f"{hotel.get('name')} (${hotel['price']}){rating}"
+            actions.append(
+                cl.Action(
+                    name="select_hotel",
+                    label=label[:80],
+                    payload={
+                        "price": hotel["price"],
+                        "name": hotel.get("name"),
+                        "index": index,
+                    },
+                )
+            )
+        await cl.Message(content="Select a hotel:", actions=actions).send()
+        return
+
+    if res_data.get("remaining_budget", 0) < 0:
+        over = abs(res_data["remaining_budget"])
+        await cl.Message(
+            content=f"Budget alert: this trip is over by **${over:.2f}**. Enter a new total budget to continue."
+        ).send()
+        return
+
+    if res_data.get("selected_flight_price") is not None and res_data.get("selected_hotel_price") is not None:
+        hotel_line = (
+            "Hotel: **Skipped**"
+            if res_data.get("hotel_skipped")
+            else f"Hotel: **${res_data.get('selected_hotel_price', 0):.2f}**"
         )
-        actions = [cl.Action(name="confirm_booking", label="✅ Confirm & Generate ID", payload={})]
+        summary = (
+            "**Final confirmation**\n"
+            f"Flight: **${res_data.get('selected_flight_price', 0):.2f}**\n"
+            f"{hotel_line}\n"
+            f"Remaining budget: **${res_data.get('remaining_budget', 0):.2f}**"
+        )
+        actions = [cl.Action(name="confirm_booking", label="Confirm and generate ID", payload={})]
         await cl.Message(content=summary, actions=actions).send()
 
-    # 5. Post-Booking: Reference ID & Sightseeing Toggle
-    elif res_data.get("is_booked"):
-        ref = res_data.get("booking_reference")
-        await cl.Message(content=f"🎉 **Booking Confirmed!**\nReference ID: `{ref}`\nUse `/retrieve {ref}` to see this later.").send()
-        
-        if res_data.get("activities") and not cl.user_session.get("activities_shown"):
-            actions = [cl.Action(name="show_spots", label="🎡 View Sightseeing Spots", value="show",payload={})]
-            await cl.Message(content="Would you like to see local attractions?", actions=actions).send()
-
-# =========================================================
-# CALLBACKS
-# =========================================================
 
 @cl.action_callback("select_flight")
 async def on_flight(action: cl.Action):
-    price = float(action.payload["price"])
-    payload = {"thread_id": cl.user_session.get("thread_id"), "action": "select_prices", "data": {"selected_flight_price": price}}
-    res = await call_agent(payload)
-    await process_agent_response(res)
+    try:
+        price = float(action.payload["price"])
+        res = await call_agent(
+            {
+                "thread_id": cl.user_session.get("thread_id"),
+                "action": "select_prices",
+                "data": {
+                    "selected_flight_price": price,
+                    "selected_flight_info": action.payload.get("info"),
+                },
+            }
+        )
+        await process_agent_response(res)
+    except Exception as exc:
+        await cl.Message(content=f"Could not select flight: {exc}").send()
+
 
 @cl.action_callback("select_hotel")
 async def on_hotel(action: cl.Action):
-    price = float(action.payload["price"])
-    payload = {"thread_id": cl.user_session.get("thread_id"), "action": "select_prices", "data": {"selected_hotel_price": price}}
-    await cl.Message(content=f"🏨 Hotel selected: ${price}. Calculating final itinerary...").send()
-    res = await call_agent(payload)
-    await process_agent_response(res)
+    try:
+        price = float(action.payload["price"])
+        await cl.Message(content=f"Hotel selected: **{action.payload.get('name')}** (${price:.2f}).").send()
+        res = await call_agent(
+            {
+                "thread_id": cl.user_session.get("thread_id"),
+                "action": "select_prices",
+                "data": {
+                    "selected_hotel_price": price,
+                    "selected_hotel_name": action.payload.get("name"),
+                },
+            }
+        )
+        await process_agent_response(res)
+    except Exception as exc:
+        await cl.Message(content=f"Could not select hotel: {exc}").send()
+
+
+@cl.action_callback("skip_hotel")
+async def on_skip_hotel(action: cl.Action):
+    try:
+        await cl.Message(content="Hotel skipped. I will continue with the flight-only itinerary.").send()
+        res = await call_agent({"thread_id": cl.user_session.get("thread_id"), "action": "skip_hotel"})
+        await process_agent_response(res)
+    except Exception as exc:
+        await cl.Message(content=f"Could not skip hotel: {exc}").send()
+
 
 @cl.action_callback("confirm_booking")
 async def on_confirm(action: cl.Action):
-    payload = {"thread_id": cl.user_session.get("thread_id"), "action": "confirm_booking"}
-    res = await call_agent(payload)
-    await process_agent_response(res)
+    try:
+        res = await call_agent({"thread_id": cl.user_session.get("thread_id"), "action": "confirm_booking"})
+        await process_agent_response(res)
+    except Exception as exc:
+        await cl.Message(content=f"Could not confirm booking: {exc}").send()
+
 
 @cl.action_callback("show_spots")
 async def on_show_spots(action: cl.Action):
     cl.user_session.set("activities_shown", True)
-    res_data = await call_agent({"thread_id": cl.user_session.get("thread_id"), "action": "retrieve"})
-    
-    for act in res_data.get("activities", [])[:5]:
-        img = [cl.Image(url=act['thumbnail'], display="inline")] if act.get('thumbnail') else []
-        await cl.Message(content=f"**{act['title']}**\n{act.get('price', 'Free')}", elements=img).send()
-        
+    try:
+        res_data = await call_agent({"thread_id": cl.user_session.get("thread_id"), "action": "retrieve"})
+        for activity in res_data.get("activities", [])[:5]:
+            image = [cl.Image(url=activity["thumbnail"], display="inline")] if activity.get("thumbnail") else []
+            link = f"\n{activity['link']}" if activity.get("link") else ""
+            await cl.Message(
+                content=f"**{activity['title']}**\n{activity.get('price', 'Check availability')}{link}",
+                elements=image,
+            ).send()
+    except Exception as exc:
+        await cl.Message(content=f"Could not load sightseeing spots: {exc}").send()
